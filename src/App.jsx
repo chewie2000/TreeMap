@@ -10,22 +10,39 @@ import { hierarchy, treemap as d3Treemap } from 'd3-hierarchy';
 
 // 3×3 grid layout constants (all in logical SVG units)
 const GRID = 3;
-const GAP  = 6;                              // gap between cells
-const CELL = 196;                            // cell side: (600 - 2*GAP) / GRID
-const SIZE = GRID * CELL + (GRID - 1) * GAP; // total canvas side = 600
+const GAP  = 6;
+const CELL = 196;
+const SIZE = GRID * CELL + (GRID - 1) * GAP; // 600
 
-// Palette – one colour per category slot
+// Palette – fallback colours per category slot
 const PALETTE = [
   '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
   '#9467bd', '#8c564b', '#e377c2', '#7f7f7f',
   '#bcbd22', '#17becf',
 ];
 
-// Return the top-left corner (in logical coords) for category index i (0–8).
-// Order: bottom-left → right along bottom row → next row up → … → top-right.
+// Label size minimums (in logical units)
+const MIN_PARENT_LABEL_WIDTH  = 80;
+const MIN_PARENT_LABEL_HEIGHT = 40;
+const MIN_DETAIL_LABEL_WIDTH  = 70;
+const MIN_DETAIL_LABEL_HEIGHT = 30;
+
+// Normalize a hex/rgb color value from data into a CSS color string.
+// Accepts "FF0000", "#FF0000", "rgb(...)", "hsl(...)", or named colors.
+const normalizeColor = (value) => {
+  if (value == null) return undefined;
+  const s = String(value).trim();
+  if (!s) return undefined;
+  if (/^#?[0-9a-fA-F]{6}$/.test(s)) return s.startsWith('#') ? s : `#${s}`;
+  if (/^rgb\s*\(/i.test(s) || /^hsl\s*\(/i.test(s)) return s;
+  return s;
+};
+
+// Map category index (0–8) to grid top-left corner.
+// Order: bottom-left → right along bottom row → next row up → top-right.
 function cellXY(i) {
   const col        = i % GRID;
-  const rowFromTop = (GRID - 1) - Math.floor(i / GRID); // 0 = top row
+  const rowFromTop = (GRID - 1) - Math.floor(i / GRID);
   return {
     x: col * (CELL + GAP),
     y: rowFromTop * (CELL + GAP),
@@ -67,34 +84,44 @@ function App() {
       allowMultiple: false,
       allowedTypes: ['number', 'integer'],
     },
+    {
+      type: 'column',
+      name: 'parentColor',
+      source: 'source',
+      allowMultiple: false,
+      allowedTypes: ['text'],
+    },
   ]);
 
-  const config     = useConfig();
-  const sourceId   = config.source;
-  const categoryId = config.category;
-  const detailId   = config.detail;
-  const sizeId     = config.size;
+  const config        = useConfig();
+  const sourceId      = config.source;
+  const categoryId    = config.category;
+  const detailId      = config.detail;
+  const sizeId        = config.size;
+  const parentColorId = config.parentColor;
 
   const data = useElementData(sourceId);
   const cols = useElementColumns(sourceId);
 
-  const categoryCol = categoryId && data ? data[categoryId] : undefined;
-  const detailCol   = detailId   && data ? data[detailId]   : undefined;
-  const sizeCol     = sizeId     && data ? data[sizeId]     : undefined;
+  const categoryCol    = categoryId    && data ? data[categoryId]    : undefined;
+  const detailCol      = detailId      && data ? data[detailId]      : undefined;
+  const sizeCol        = sizeId        && data ? data[sizeId]        : undefined;
+  const parentColorCol = parentColorId && data ? data[parentColorId] : undefined;
 
   const categoryInfo = categoryId && cols ? cols[categoryId] : undefined;
   const detailInfo   = detailId   && cols ? cols[detailId]   : undefined;
   const sizeInfo     = sizeId     && cols ? cols[sizeId]     : undefined;
 
   // 2) Aggregate by category then detail.
-  //    Categories are taken in first-appearance order, capped at 9.
-  //    Size only drives detail rectangles; parent cells are all equal.
+  //    Capture per-category color (first non-empty value wins).
+  //    Cap at 9 categories. Sort alphabetically — grid runs A-Z bottom-left to top-right.
   const { rootData, total } = useMemo(() => {
     if (!categoryCol || !detailCol || !sizeCol) {
       return { rootData: null, total: 0 };
     }
 
-    const catMap = new Map(); // category → Map(detail → value)
+    const catMap      = new Map(); // category → Map(detail → value)
+    const catColorMap = new Map(); // category → normalized CSS color
     let totalVal = 0;
 
     for (let i = 0; i < categoryCol.length; i++) {
@@ -103,9 +130,13 @@ function App() {
       const val    = Number(sizeCol[i]) || 0;
 
       if (!Number.isFinite(val) || val <= 0) continue;
-
-      // Skip rows whose category would be the 10th or later unique category
       if (!catMap.has(cat) && catMap.size >= 9) continue;
+
+      // First non-empty color for this category wins
+      if (parentColorCol) {
+        const norm = normalizeColor(parentColorCol[i]);
+        if (norm && !catColorMap.has(cat)) catColorMap.set(cat, norm);
+      }
 
       let detailMap = catMap.get(cat);
       if (!detailMap) {
@@ -128,14 +159,24 @@ function App() {
           pct: catTotal ? (value / catTotal) * 100 : 0, // within-category %
         });
       }
-      categories.push({ name: cat, children, catTotal });
+      categories.push({
+        name: cat,
+        color: catColorMap.get(cat), // undefined if no parentColor column
+        children,
+        catTotal,
+      });
     }
+
+    // Alphabetical sort → grid positions run A-Z from bottom-left to top-right
+    categories.sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { numeric: true })
+    );
 
     return {
       rootData: { name: 'root', children: categories },
       total: totalVal,
     };
-  }, [categoryCol, detailCol, sizeCol]);
+  }, [categoryCol, detailCol, sizeCol, parentColorCol]);
 
   // 3) Fixed 3×3 grid for parent cells; D3 treemap per cell for detail items.
   const { categoryNodes, detailNodes } = useMemo(() => {
@@ -146,21 +187,22 @@ function App() {
 
     rootData.children.forEach((cat, idx) => {
       const { x: x0, y: y0 } = cellXY(idx);
-      const color = PALETTE[idx % PALETTE.length];
+      const fallback = PALETTE[idx % PALETTE.length];
+      const color    = normalizeColor(cat.color) || fallback;
 
       catNodes.push({
-        key:   cat.name,
-        name:  cat.name,
-        value: cat.catTotal,
-        pct:   total ? (cat.catTotal / total) * 100 : 0,
-        x:     x0,
-        y:     y0,
+        key:    cat.name,
+        name:   cat.name,
+        value:  cat.catTotal,
+        pct:    total ? (cat.catTotal / total) * 100 : 0,
+        x:      x0,
+        y:      y0,
         width:  CELL,
         height: CELL,
         color,
       });
 
-      // D3 treemap inside this cell – size column drives detail layout
+      // D3 treemap inside this cell — size column drives detail layout
       const cellRoot = hierarchy({ name: cat.name, children: cat.children })
         .sum(d => d.value)
         .sort((a, b) => (b.value || 0) - (a.value || 0));
@@ -196,6 +238,7 @@ function App() {
           <li><b>category</b> (top-level text column — up to 9 used)</li>
           <li><b>detail</b> (detail / subcategory text column)</li>
           <li><b>size</b> (numeric column — drives detail rectangle sizes)</li>
+          <li>(optional) <b>parentColor</b> (text color per row, e.g. FF0000 or #FF0000)</li>
         </ul>
       </div>
     );
@@ -215,7 +258,6 @@ function App() {
 
   const numberFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
 
-  // Text fit estimation (with wrapping)
   const charUnits = 5;
   const lineUnits = 14;
 
@@ -223,8 +265,8 @@ function App() {
     if (widthUnits <= 0 || heightUnits <= 0) return false;
     const totalChars = lines.join(' ').length || 0;
     if (!totalChars) return true;
-    const columns    = Math.max(1, Math.floor(widthUnits / charUnits));
-    const estLines   = Math.ceil(totalChars / columns);
+    const columns  = Math.max(1, Math.floor(widthUnits / charUnits));
+    const estLines = Math.ceil(totalChars / columns);
     return estLines * lineUnits <= heightUnits;
   };
 
@@ -290,6 +332,7 @@ function App() {
 
         {/* Category name + total in top-left of each cell */}
         {categoryNodes.map((c) => {
+          if (c.width < MIN_PARENT_LABEL_WIDTH || c.height < MIN_PARENT_LABEL_HEIGHT) return null;
           const parentLines = [
             c.name,
             `${numberFmt.format(c.value)} (${numberFmt.format(c.pct)}%)`,
@@ -310,6 +353,7 @@ function App() {
                 transform: 'translate(4px, 4px)',
                 fontSize: 11,
                 color: '#000',
+                background: 'transparent',
                 padding: '2px 4px',
                 borderRadius: 3,
                 border: `1px solid ${c.color}`,
@@ -327,6 +371,7 @@ function App() {
 
         {/* Detail labels centred on larger detail rectangles */}
         {detailNodes.map((n) => {
+          if (n.width < MIN_DETAIL_LABEL_WIDTH || n.height < MIN_DETAIL_LABEL_HEIGHT) return null;
           const detailLines = [
             n.detail,
             `${numberFmt.format(n.value)} (${numberFmt.format(n.pct)}%)`,
@@ -347,6 +392,7 @@ function App() {
                 transform: 'translate(-50%, -50%)',
                 fontSize: 11,
                 color: '#000',
+                background: 'transparent',
                 padding: '2px 4px',
                 borderRadius: 3,
                 maxWidth: `${maxWidthPct}%`,
@@ -355,7 +401,7 @@ function App() {
                 textAlign: 'center',
               }}
             >
-              <div>{n.detail}</div>
+              <div><b>{n.detail}</b></div>
               <div>{numberFmt.format(n.value)} ({numberFmt.format(n.pct)}%)</div>
             </div>
           );
