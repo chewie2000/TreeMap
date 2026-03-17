@@ -12,12 +12,46 @@ import { hierarchy, treemap as d3Treemap } from 'd3-hierarchy';
 const WIDTH = 600;
 const HEIGHT = 380;
 
-// Palette for categories (colors by top-level Category)
+// Palette for categories (fallback colors by top-level Category)
 const PALETTE = [
-  '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
-  '#9467bd', '#8c564b', '#e377c2', '#7f7f7f',
-  '#bcbd22', '#17becf',
+  '#1f77b4',
+  '#ff7f0e',
+  '#2ca02c',
+  '#d62728',
+  '#9467bd',
+  '#8c564b',
+  '#e377c2',
+  '#7f7f7f',
+  '#bcbd22',
+  '#17becf',
 ];
+
+// Label sizing heuristics
+const MIN_PARENT_LABEL_WIDTH = 80;
+const MIN_PARENT_LABEL_HEIGHT = 40;
+const MIN_DETAIL_LABEL_WIDTH = 70;
+const MIN_DETAIL_LABEL_HEIGHT = 30;
+
+// Normalize text color from the record set into a CSS color
+// Accepts hex like "FF0000" or "#FF0000", or rgb()/hsl() strings.
+const normalizeColor = (value) => {
+  if (value == null) return undefined;
+  const s = String(value).trim();
+  if (!s) return undefined;
+
+  // Hex RGB: "FF0000" or "#FF0000"
+  if (/^#?[0-9a-fA-F]{6}$/.test(s)) {
+    return s.startsWith('#') ? s : `#${s}`;
+  }
+
+  // Already a CSS color function
+  if (/^rgb\s*\(/i.test(s) || /^hsl\s*\(/i.test(s)) {
+    return s;
+  }
+
+  // Otherwise, let the browser try if it's a named color, or ignore
+  return s;
+};
 
 function App() {
   // Make the iframe document fill the plugin without scrollbars
@@ -43,6 +77,7 @@ function App() {
   }, []);
 
   // 1) Sigma editor panel config
+  // parentColor is a TEXT column in the record set (e.g. "FF0000" or "#FF0000")
   useEditorPanelConfig([
     { type: 'element', name: 'source' },
     {
@@ -66,40 +101,60 @@ function App() {
       allowMultiple: false,
       allowedTypes: ['number', 'integer'],
     },
+    {
+      type: 'column',
+      name: 'parentColor',
+      source: 'source',
+      allowMultiple: false,
+      allowedTypes: ['text'],
+    },
   ]);
 
-  const config = useConfig(); // { source, category, detail, size }
-  const sourceId   = config.source;
+  const config = useConfig();
+  const sourceId = config.source;
   const categoryId = config.category;
-  const detailId   = config.detail;
-  const sizeId     = config.size;
+  const detailId = config.detail;
+  const sizeId = config.size;
+  const parentColorId = config.parentColor;
 
   const data = useElementData(sourceId);
   const cols = useElementColumns(sourceId);
 
   const categoryCol = categoryId && data ? data[categoryId] : undefined;
-  const detailCol   = detailId   && data ? data[detailId]   : undefined;
-  const sizeCol     = sizeId     && data ? data[sizeId]     : undefined;
+  const detailCol = detailId && data ? data[detailId] : undefined;
+  const sizeCol = sizeId && data ? data[sizeId] : undefined;
+  const parentColorCol =
+    parentColorId && data ? data[parentColorId] : undefined;
 
   const categoryInfo = categoryId && cols ? cols[categoryId] : undefined;
-  const detailInfo   = detailId   && cols ? cols[detailId]   : undefined;
-  const sizeInfo     = sizeId     && cols ? cols[sizeId]     : undefined;
+  const detailInfo = detailId && cols ? cols[detailId] : undefined;
+  const sizeInfo = sizeId && cols ? cols[sizeId] : undefined;
 
-  // 2) Aggregate by Category + Detail and compute total for %
+  // 2) Aggregate by Category + Detail, and capture a color per Category from the record set
   const { rootData, total } = useMemo(() => {
     if (!categoryCol || !detailCol || !sizeCol) {
       return { rootData: null, total: 0 };
     }
 
-    const catMap = new Map(); // cat -> (detail -> value)
+    const catMap = new Map(); // cat -> Map(detail -> value)
+    const catColorMap = new Map(); // cat -> normalized color
     let totalVal = 0;
 
     for (let i = 0; i < categoryCol.length; i++) {
-      const cat    = categoryCol[i] ?? '(null)';
-      const detail = detailCol[i]   ?? '(null)';
-      const val    = Number(sizeCol[i]) || 0;
+      const cat = categoryCol[i] ?? '(null)';
+      const detail = detailCol[i] ?? '(null)';
+      const val = Number(sizeCol[i]) || 0;
 
       if (!Number.isFinite(val) || val <= 0) continue;
+
+      // Capture category color from parentColorCol (first non-empty wins)
+      if (parentColorCol) {
+        const rawColor = parentColorCol[i];
+        const norm = normalizeColor(rawColor);
+        if (norm && !catColorMap.has(cat)) {
+          catColorMap.set(cat, norm);
+        }
+      }
 
       let detailMap = catMap.get(cat);
       if (!detailMap) {
@@ -111,7 +166,6 @@ function App() {
     }
 
     const categories = [];
-
     for (const [cat, detailMap] of catMap.entries()) {
       const children = [];
       for (const [detail, value] of detailMap.entries()) {
@@ -123,9 +177,9 @@ function App() {
           pct,
         });
       }
-
       categories.push({
         name: cat,
+        color: catColorMap.get(cat), // may be undefined; handled later
         children,
       });
     }
@@ -136,27 +190,47 @@ function App() {
     };
 
     return { rootData, total: totalVal };
-  }, [categoryCol, detailCol, sizeCol]);
+  }, [categoryCol, detailCol, sizeCol, parentColorCol]);
 
-  // 3) D3 treemap layout → parent (category) frames + detail leaves
+  // 3) D3 treemap layout
   const { categoryNodes, detailNodes } = useMemo(() => {
     if (!rootData || !total) return { categoryNodes: [], detailNodes: [] };
 
     const root = hierarchy(rootData)
-      .sum(d => d.value)
-      .sort((a, b) => (b.value || 0) - (a.value || 0));
+      .sum((d) => d.value)
+      // Sort depth-1 categories alphabetically by name
+      .sort((a, b) => {
+        if (a.depth === 1 && b.depth === 1) {
+          const an = (a.data.name || '').toString();
+          const bn = (b.data.name || '').toString();
+          return an.localeCompare(bn, undefined, { numeric: true });
+        }
+        if (a.parent === b.parent && a.depth === 2 && b.depth === 2) {
+          return (b.value || 0) - (a.value || 0);
+        }
+        return (b.value || 0) - (a.value || 0);
+      });
 
-    const layout = d3Treemap()
-      .size([WIDTH, HEIGHT])
-      .paddingInner(2);
+    const layout = d3Treemap().size([WIDTH, HEIGHT]).paddingInner(2);
 
     layout(root);
 
+    // Flip vertically so first categories appear along the bottom row
+    root.each((node) => {
+      const y0 = node.y0;
+      const y1 = node.y1;
+      node.y0 = HEIGHT - y1;
+      node.y1 = HEIGHT - y0;
+    });
+
     const categories = root.children || [];
+
+    // Rects for top-level categories
     const categoryNodes = categories.map((node, idx) => {
       const value = node.value || 0;
-      const pct   = total ? (value / total) * 100 : 0;
-      const color = PALETTE[idx % PALETTE.length];
+      const pct = total ? (value / total) * 100 : 0;
+      const fallback = PALETTE[idx % PALETTE.length];
+      const color = normalizeColor(node.data.color) || fallback;
       return {
         key: node.data.name,
         name: node.data.name,
@@ -170,19 +244,26 @@ function App() {
       };
     });
 
-    const colorIndexByCategory = new Map(
-      categoryNodes.map((c, idx) => [c.name, idx])
+    const colorByCategoryName = new Map(
+      categoryNodes.map((c) => [c.name, c.color])
     );
 
+    const colorIndexByCategory = new Map(
+      categories.map((node, idx) => [node.data.name, idx])
+    );
+
+    // Rects for detail-level leaves
     const leaves = root.leaves();
     const detailNodes = leaves.map((node) => {
-      const detailName   = node.data.name;
+      const detailName = node.data.name;
       const categoryName = node.data.category;
-      const value        = node.data.value;
-      const pct          = node.data.pct;
+      const value = node.data.value;
+      const pct = node.data.pct;
 
       const idx = colorIndexByCategory.get(categoryName) ?? 0;
-      const fill = PALETTE[idx % PALETTE.length];
+      const fallbackFill = PALETTE[idx % PALETTE.length];
+      const fill =
+        colorByCategoryName.get(categoryName) || normalizeColor(fallbackFill);
 
       return {
         key: `${categoryName}::${detailName}`,
@@ -201,16 +282,27 @@ function App() {
     return { categoryNodes, detailNodes };
   }, [rootData, total]);
 
-  // 4) Guard states
   if (!sourceId || !categoryId || !detailId || !sizeId) {
     return (
       <div style={{ fontFamily: 'sans-serif', fontSize: 12, padding: 12 }}>
         In the editor panel, set:
         <ul>
-          <li><b>source</b> (table/pivot)</li>
-          <li><b>category</b> (top-level text column)</li>
-          <li><b>detail</b> (detail / subcategory text column)</li>
-          <li><b>size</b> (numeric column)</li>
+          <li>
+            <b>source</b> (table/pivot)
+          </li>
+          <li>
+            <b>category</b> (top-level text column)
+          </li>
+          <li>
+            <b>detail</b> (detail / subcategory text column)
+          </li>
+          <li>
+            <b>size</b> (numeric column)
+          </li>
+          <li>
+            (optional) <b>parentColor</b> (text color per row/category, e.g.
+            FF0000 or #FF0000)
+          </li>
         </ul>
       </div>
     );
@@ -225,14 +317,15 @@ function App() {
   }
 
   const categoryLabel = categoryInfo?.name ?? 'Category';
-  const detailLabel   = detailInfo?.name   ?? 'Detail';
-  const sizeLabel     = sizeInfo?.name     ?? 'Size';
+  const detailLabel = detailInfo?.name ?? 'Detail';
+  const sizeLabel = sizeInfo?.name ?? 'Size';
 
-  const numberFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
+  const numberFmt = new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 2,
+  });
 
-  // Text fit estimation (with wrapping)
-  const charUnits = 5;    // approx width per character in layout units
-  const lineUnits = 14;   // approx height per line in layout units
+  const charUnits = 5;
+  const lineUnits = 14;
 
   const canFitWrapped = (widthUnits, heightUnits, lines) => {
     if (widthUnits <= 0 || heightUnits <= 0) return false;
@@ -246,7 +339,6 @@ function App() {
     return neededHeight <= heightUnits;
   };
 
-  // 5) Render: full-height container; SVG stretched; overlay labels with wrapping
   return (
     <div
       style={{
@@ -259,14 +351,12 @@ function App() {
         fontFamily: 'sans-serif',
       }}
     >
-      {/* Background SVG with parent frames + detail rectangles */}
       <svg
         width="100%"
         height="100%"
         viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         preserveAspectRatio="none"
       >
-        {/* Parent category frames: thick, colored by category */}
         {categoryNodes.map((c) => (
           <rect
             key={`parent-${c.key}`}
@@ -276,11 +366,10 @@ function App() {
             height={Math.max(0, c.height)}
             fill="none"
             stroke={c.color}
-            strokeWidth={10}   // thick frame
+            strokeWidth={10}
           />
         ))}
 
-        {/* Detail rectangles inside frames */}
         {detailNodes.map((n) => (
           <g key={n.key}>
             <rect
@@ -305,7 +394,6 @@ function App() {
         ))}
       </svg>
 
-      {/* HTML overlay for crisp labels (not stretched) */}
       <div
         style={{
           position: 'absolute',
@@ -313,19 +401,26 @@ function App() {
           pointerEvents: 'none',
         }}
       >
-        {/* Parent totals in top-left of each parent frame (wrapped, only if fit) */}
         {categoryNodes.map((c) => {
           const parentLines = [
             c.name,
-            `${numberFmt.format(c.value)} ({numberFmt.format(c.pct)}%)`,
+            `${numberFmt.format(c.value)} (${numberFmt.format(c.pct)}%)`,
           ];
+
+          // Extra guard: skip if tile is too small
+          if (
+            c.width < MIN_PARENT_LABEL_WIDTH ||
+            c.height < MIN_PARENT_LABEL_HEIGHT
+          ) {
+            return null;
+          }
 
           if (!canFitWrapped(c.width, c.height, parentLines)) {
             return null;
           }
 
           const leftPct = (c.x / WIDTH) * 100;
-          const topPct  = (c.y / HEIGHT) * 100;
+          const topPct = (c.y / HEIGHT) * 100;
           const maxWidthPct = (c.width / WIDTH) * 100;
 
           return (
@@ -348,7 +443,9 @@ function App() {
                 textAlign: 'left',
               }}
             >
-              <div><b>{c.name}</b></div>
+              <div>
+                <b>{c.name}</b>
+              </div>
               <div>
                 {numberFmt.format(c.value)} ({numberFmt.format(c.pct)}%)
               </div>
@@ -356,20 +453,27 @@ function App() {
           );
         })}
 
-        {/* Detail labels in the centre of larger detail rectangles (wrapped, only if fit) */}
         {detailNodes.map((n) => {
+          // Detail label now only shows: Detail (bold) and stats line.
           const detailLines = [
-            n.category,
             n.detail,
             `${numberFmt.format(n.value)} (${numberFmt.format(n.pct)}%)`,
           ];
+
+          // Extra guard: skip if tile is too small
+          if (
+            n.width < MIN_DETAIL_LABEL_WIDTH ||
+            n.height < MIN_DETAIL_LABEL_HEIGHT
+          ) {
+            return null;
+          }
 
           if (!canFitWrapped(n.width, n.height, detailLines)) {
             return null;
           }
 
-          const centerX = (n.x + n.width / 2) / WIDTH * 100;
-          const centerY = (n.y + n.height / 2) / HEIGHT * 100;
+          const centerX = ((n.x + n.width / 2) / WIDTH) * 100;
+          const centerY = ((n.y + n.height / 2) / HEIGHT) * 100;
           const maxWidthPct = (n.width / WIDTH) * 100;
 
           return (
@@ -391,8 +495,9 @@ function App() {
                 textAlign: 'center',
               }}
             >
-              <div>{n.category}</div>
-              <div>{n.detail}</div>
+              <div>
+                <b>{n.detail}</b>
+              </div>
               <div>
                 {numberFmt.format(n.value)} ({numberFmt.format(n.pct)}%)
               </div>
